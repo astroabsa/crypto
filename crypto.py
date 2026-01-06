@@ -1,33 +1,32 @@
 import streamlit as st
 import requests
 import pandas as pd
-import numpy as np
 import time
-from datetime import datetime, timedelta
 
 # ==========================================
-# CONFIGURATION & STRATEGY PARAMETERS
+# CONFIGURATION
 # ==========================================
-BASE_URL = "https://api.delta.exchange"  # Use https://api.india.delta.exchange for India users
+st.set_page_config(page_title="Crypto Blast Dashboard", layout="wide", page_icon="🚀")
+
+BASE_URL = "https://api.delta.exchange" 
+# Note: If you are in India and get connection errors, switch to: 
+# BASE_URL = "https://api.india.delta.exchange"
+
+# Fixed Settings
+TIMEFRAME = '1h'
+TOP_N_COINS = 25
+REFRESH_SECONDS = 300  # 5 Minutes
+
 s = requests.Session()
 
-st.set_page_config(page_title="Crypto Blast Scanner", layout="wide")
-
 # ==========================================
-# 1. API DATA FUNCTIONS
+# 1. DATA FETCHING
 # ==========================================
 
-@st.cache_data(ttl=300)
-def get_top_liquid_pairs(limit=20):
-    """
-    Fetches all products, filters for USDT perps, 
-    and returns the top 'limit' coins by 24h Volume to avoid rate limits.
-    """
+def get_top_liquid_pairs(limit=25):
+    """Fetches Top N USDT Perpetual coins by volume."""
     try:
-        # 1. Get all products to map symbols to IDs
         prods = s.get(f"{BASE_URL}/v2/products").json()['result']
-        
-        # Filter for Active USDT Perpetuals only
         perp_products = [
             p for p in prods 
             if p['contract_type'] == 'perpetual_futures' 
@@ -35,191 +34,181 @@ def get_top_liquid_pairs(limit=20):
             and p['quoting_asset']['symbol'] == 'USDT'
         ]
         
-        # 2. Get 24h Ticker stats to sort by volume
         tickers = s.get(f"{BASE_URL}/v2/tickers").json()['result']
-        
-        # Create a map of symbol -> volume
         vol_map = {t['symbol']: float(t['volume']) for t in tickers if 'volume' in t}
         
-        # Sort products by volume (descending)
+        # Sort by volume desc
         perp_products.sort(key=lambda x: vol_map.get(x['symbol'], 0), reverse=True)
-        
         return perp_products[:limit]
-        
     except Exception as e:
-        st.error(f"Error fetching products: {e}")
         return []
 
 def get_historical_data(symbol, resolution='1h', limit=50):
-    """
-    Fetches OHLC + Open Interest data for a symbol.
-    Delta Exchange API allows fetching candles.
-    """
+    """Fetches OHLC data."""
     end_time = int(time.time())
-    # Estimate start time based on resolution (rough approx)
-    if resolution == '1h':
-        start_time = end_time - (limit * 3600 * 2)
-    elif resolution == '4h':
-        start_time = end_time - (limit * 3600 * 4 * 2)
-    else: # 15m
-        start_time = end_time - (limit * 900 * 2)
-
-    params = {
-        'symbol': symbol,
-        'resolution': resolution,
-        'start': start_time,
-        'end': end_time
-    }
+    start_time = end_time - (limit * 3600 * 2) # buffer for 1h
+    
+    params = {'symbol': symbol, 'resolution': resolution, 'start': start_time, 'end': end_time}
     
     try:
-        # Note: Delta API endpoint for candles
         resp = s.get(f"{BASE_URL}/v2/history/candles", params=params)
         data = resp.json()
-        
         if 'result' in data and data['result']:
             df = pd.DataFrame(data['result'])
-            # Ensure sorting
             df = df.sort_values('time')
             return df
         return pd.DataFrame()
-    except Exception as e:
+    except:
         return pd.DataFrame()
 
 # ==========================================
-# 2. TECHNICAL ANALYSIS (THE LOGIC)
+# 2. TECHNICAL ANALYSIS
 # ==========================================
 
-def calculate_metrics(df):
-    """
-    Calculates BB, KC, and Returns a Status.
-    """
+def analyze_coin(df):
     if df.empty or len(df) < 21:
         return None
 
-    # Clean data types
-    df['close'] = df['close'].astype(float)
-    df['high'] = df['high'].astype(float)
-    df['low'] = df['low'].astype(float)
-    # Some exchanges return 'oi' or 'open_interest' in candle data
-    # If delta doesn't provide OI in candles, we might need a separate call, 
-    # but for this script we assume standard OHLCV. 
-    # Note: Delta candles usually don't have OI inside standard candles, 
-    # so we will use Volume Trend as a proxy if OI is missing, 
-    # or check if specific OI history endpoint exists.
-    # *Update*: Delta V2 candles often just have OHLCV. 
-    # We will use 'close' and 'volume' for the squeeze, 
-    # and we will mock the "OI" check using Volume accumulation for this demo 
-    # unless OI key is present.
-    
-    # --- Bollinger Bands (20, 2) ---
-    df['sma20'] = df['close'].rolling(window=20).mean()
-    df['stddev'] = df['close'].rolling(window=20).std()
-    df['bb_upper'] = df['sma20'] + (2.0 * df['stddev'])
-    df['bb_lower'] = df['sma20'] - (2.0 * df['stddev'])
+    # Cast to float
+    close = df['close'].astype(float)
+    high = df['high'].astype(float)
+    low = df['low'].astype(float)
+    volume = df['volume'].astype(float)
 
-    # --- Keltner Channels (20, 1.5) ---
-    # TR calculation
-    df['tr1'] = df['high'] - df['low']
-    df['tr2'] = abs(df['high'] - df['close'].shift(1))
-    df['tr3'] = abs(df['low'] - df['close'].shift(1))
-    df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
-    df['atr'] = df['tr'].rolling(window=20).mean()
-    
-    df['kc_upper'] = df['sma20'] + (1.5 * df['atr'])
-    df['kc_lower'] = df['sma20'] - (1.5 * df['atr'])
+    # --- BB (20, 2) ---
+    sma20 = close.rolling(window=20).mean()
+    stddev = close.rolling(window=20).std()
+    bb_upper = sma20 + (2.0 * stddev)
+    bb_lower = sma20 - (2.0 * stddev)
 
-    # --- THE SQUEEZE CONDITION ---
-    # BB inside KC
-    current = df.iloc[-1]
-    prev = df.iloc[-2]
+    # --- KC (20, 1.5) ---
+    tr1 = high - low
+    tr2 = abs(high - close.shift(1))
+    tr3 = abs(low - close.shift(1))
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(window=20).mean()
     
-    squeeze_on = (current['bb_upper'] < current['kc_upper']) and (current['bb_lower'] > current['kc_lower'])
+    kc_upper = sma20 + (1.5 * atr)
+    kc_lower = sma20 - (1.5 * atr)
+
+    # Current Candle Values
+    curr_close = close.iloc[-1]
+    curr_sma = sma20.iloc[-1]
+    curr_bb_up = bb_upper.iloc[-1]
+    curr_bb_low = bb_lower.iloc[-1]
+    curr_kc_up = kc_upper.iloc[-1]
+    curr_kc_low = kc_lower.iloc[-1]
     
-    # --- MOMENTUM / BLAST POTENTIAL ---
-    # 1. Price is near the bands (ready to break)
-    # 2. Volume is rising (using Volume as proxy for OI/Activity here)
-    vol_sma = df['volume'].rolling(window=20).mean().iloc[-1]
-    high_volume = current['volume'] > vol_sma
+    # Squeeze Condition: BB inside KC
+    squeeze_on = (curr_bb_up < curr_kc_up) and (curr_bb_low > curr_kc_low)
     
+    # Volume Condition (Rising?)
+    vol_sma = volume.rolling(window=20).mean().iloc[-1]
+    high_vol = volume.iloc[-1] > vol_sma
+
+    # Direction Prediction (Simple Trend Filter)
+    # If Price > Basis (SMA20) -> Bullish, else Bearish
+    direction = "🟢 BULL" if curr_close > curr_sma else "🔴 BEAR"
+
     return {
-        "price": current['close'],
+        "price": curr_close,
         "squeeze": squeeze_on,
-        "bb_width": current['bb_upper'] - current['bb_lower'],
-        "volume_spike": high_volume,
-        "change_24h": ((current['close'] - df.iloc[-20]['close']) / df.iloc[-20]['close']) * 100
+        "high_vol": high_vol,
+        "direction": direction,
+        "bb_width": curr_bb_up - curr_bb_low
     }
 
 # ==========================================
-# 3. STREAMLIT UI
+# 3. MAIN APP LOOP
 # ==========================================
 
-st.title("🚀 Delta Exchange: Momentum Blast Scanner")
-st.markdown("Finds coins in a **Bollinger Squeeze** (Energy Accumulation) with rising activity.")
+st.title("🚀 Crypto Momentum Dashboard")
+st.markdown(f"**Status:** Scanning Top {TOP_N_COINS} coins (1H Timeframe). Auto-refreshing every 5 mins.")
 
-with st.sidebar:
-    st.header("Scanner Settings")
-    timeframe = st.selectbox("Timeframe", ["1h", "4h", "15m"], index=0)
-    top_n = st.slider("Scan Top N Coins (Volume)", 10, 50, 20)
-    st.info("Note: Scanning fewer coins is faster and avoids API rate limits.")
+# Placeholder for the main content to allow refreshing without duplicating
+main_placeholder = st.empty()
 
-if st.button("Start Scan"):
-    status_text = st.empty()
-    progress_bar = st.progress(0)
-    
-    status_text.text("Fetching active market pairs...")
-    products = get_top_liquid_pairs(limit=top_n)
-    
-    results = []
-    
-    for i, p in enumerate(products):
-        symbol = p['symbol']
-        status_text.text(f"Analyzing {symbol}...")
+def run_dashboard():
+    with main_placeholder.container():
+        # 1. Fetch
+        products = get_top_liquid_pairs(limit=TOP_N_COINS)
         
-        # 1. Fetch Data
-        df = get_historical_data(symbol, resolution=timeframe)
+        if not products:
+            st.error("Failed to fetch data. Check API connection.")
+            return
+
+        results = []
         
-        # 2. Analyze
-        if df is not None:
-            metrics = calculate_metrics(df)
+        # Progress bar for feedback
+        progress_text = st.empty()
+        my_bar = st.progress(0)
+
+        for i, p in enumerate(products):
+            symbol = p['symbol']
+            # progress_text.text(f"Scanning {symbol}...") # Optional: clean UI by hiding text
+            
+            df = get_historical_data(symbol, resolution=TIMEFRAME)
+            metrics = analyze_coin(df)
             
             if metrics:
-                # We filter for coins that are EITHER in a squeeze OR have a massive volume spike
-                if metrics['squeeze'] or metrics['volume_spike']:
-                    results.append({
-                        "Symbol": symbol,
-                        "Price": metrics['price'],
-                        "Status": "🔥 SQUEEZE" if metrics['squeeze'] else "⚠️ VOL SPIKE",
-                        "24h Change %": round(metrics['change_24h'], 2),
-                        "BB Width": round(metrics['bb_width'], 4)
-                    })
-        
-        # Update Progress
-        progress_bar.progress((i + 1) / len(products))
-        time.sleep(0.1) # Respect rate limits
+                # Construct TradingView URL (Using Binance for generic USDT chart mapping)
+                # Cleaning symbol just in case
+                clean_symbol = symbol.replace("-", "") 
+                tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{clean_symbol}"
 
-    progress_bar.empty()
-    status_text.text("Scan Complete!")
+                # Status Label
+                if metrics['squeeze']:
+                    status = "🔥 SQUEEZE"
+                elif metrics['high_vol']:
+                    status = "⚠️ VOL SPIKE"
+                else:
+                    status = "—"
 
-    if results:
-        results_df = pd.DataFrame(results)
-        
-        # Styling the dataframe
-        st.subheader(f"Found {len(results)} Coins Ready to Move")
-        
-        # Highlight logic
-        def highlight_squeeze(val):
-            color = '#ff4b4b' if 'SQUEEZE' in val else '#fca311'
-            return f'color: {color}; font-weight: bold'
+                results.append({
+                    "Symbol": symbol,
+                    "Chart": tv_url, # The raw URL for the link column
+                    "Price": metrics['price'],
+                    "Trend": metrics['direction'],
+                    "Status": status,
+                    "Squeeze": metrics['squeeze'], # Hidden column for sorting/filtering if needed
+                })
+            
+            my_bar.progress((i + 1) / len(products))
+            time.sleep(0.05) # Tiny delay to be nice to API
 
-        st.dataframe(
-            results_df.style.applymap(highlight_squeeze, subset=['Status']),
-            use_container_width=True
-        )
+        my_bar.empty() # Clear progress bar
         
-        st.markdown("### Interpretation")
-        st.markdown("""
-        * **🔥 SQUEEZE:** The market is "coiled" (Bollinger Bands are inside Keltner Channels). A big move is imminent. Wait for a breakout.
-        * **⚠️ VOL SPIKE:** The squeeze might be breaking *now*. Volume is higher than average.
-        """)
-    else:
-        st.warning("No coins found matching the 'Blast' criteria right now. The market might be trending already.")
+        # 2. Display Results
+        if results:
+            df_res = pd.DataFrame(results)
+            
+            # Sort: Put 'SQUEEZE' at the top
+            df_res['sort_val'] = df_res['Status'].apply(lambda x: 0 if 'SQUEEZE' in x else (1 if 'SPIKE' in x else 2))
+            df_res = df_res.sort_values('sort_val').drop(columns=['sort_val'])
+
+            # Dataframe Configuration
+            st.data_editor(
+                df_res,
+                column_config={
+                    "Chart": st.column_config.LinkColumn(
+                        "Chart Link",
+                        help="Click to open TradingView",
+                        display_text="Open Chart ↗️"
+                    ),
+                    "Price": st.column_config.NumberColumn(format="$%.4f"),
+                },
+                hide_index=True,
+                use_container_width=True,
+                disabled=["Symbol", "Price", "Trend", "Status"]
+            )
+            
+            st.caption(f"Last Updated: {time.strftime('%H:%M:%S')}")
+        else:
+            st.warning("No data found.")
+
+# Run the logic immediately
+run_dashboard()
+
+# Wait and Rerun
+time.sleep(REFRESH_SECONDS)
+st.rerun()
